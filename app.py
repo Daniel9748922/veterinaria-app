@@ -1,166 +1,172 @@
 import streamlit as st
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, date
 
-# 1. Configuración de Conexión (Asegúrate de tener estos nombres en Streamlit Secrets)
+# 1. Configuración de Conexión
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-st.set_page_config(page_title="VetControl Pro", layout="wide")
-st.title("🐾 VetControl: Gestión Veterinaria Integral")
+st.set_page_config(page_title="VetControl Pro", layout="wide", page_icon="🐾")
+
+# Estilo CSS para mejorar la visualización
+st.markdown("""
+    <style>
+    .main { background-color: #f5f7f9; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    </style>
+    """, unsafe_allow_密=True)
+
+st.title("🐾 VetControl: Gestión Veterinaria")
 
 # Menú Lateral
-menu = ["Dashboard", "Categorías y Productos", "Entrada de Inventario (FEFO)", "Ventas Rápidas", "Flujo de Caja"]
+menu = ["📊 Dashboard Interactivo", "🔍 Buscador de Stock", "📦 Categorías y Productos", "📥 Entrada (Lotes/FEFO)", "🛒 Ventas Rápidas", "💰 Flujo de Caja"]
 choice = st.sidebar.selectbox("Menú de Navegación", menu)
 
-# --- MÓDULO 1: DASHBOARD ---
-if choice == "Dashboard":
-    st.subheader("📦 Estado Actual del Inventario (Orden FEFO)")
+# --- MÓDULO 1: DASHBOARD INTERACTIVO ---
+if choice == "📊 Dashboard Interactivo":
+    st.subheader("Estado Crítico de Inventario")
     
-    # Consulta combinada: Lotes + Nombre del Producto
+    # Consulta de lotes con stock
     res = supabase.table("inventario_lotes").select("cantidad_actual, fecha_vencimiento, productos(nombre)").gt("cantidad_actual", 0).order("fecha_vencimiento").execute()
     
     if res.data:
-        datos_vista = []
+        # Métricas rápidas
+        hoy = date.today()
+        proximos_vencer = 0
+        stock_total = 0
+        
+        datos_tabla = []
         for item in res.data:
-            datos_vista.append({
+            f_venc = datetime.strptime(item['fecha_vencimiento'], '%Y-%m-%d').date()
+            dias_restantes = (f_venc - hoy).days
+            stock_total += item['cantidad_actual']
+            
+            # Lógica de colores/alertas
+            estado = "✅ Ok"
+            if dias_restantes <= 0:
+                estado = "❌ VENCIDO"
+                proximos_vencer += 1
+            elif dias_restantes <= 30:
+                estado = "⚠️ Vence pronto"
+                proximos_vencer += 1
+                
+            datos_tabla.append({
                 "Producto": item['productos']['nombre'],
-                "Stock Disponible": item['cantidad_actual'],
-                "Vence el": item['fecha_vencimiento']
+                "Cantidad": item['cantidad_actual'],
+                "Vencimiento": item['fecha_vencimiento'],
+                "Días restantes": dias_restantes,
+                "Estado": estado
             })
-        st.table(datos_vista)
-    else:
-        st.info("No hay stock disponible. Registra una entrada en el menú.")
 
-# --- MÓDULO 2: CATEGORÍAS Y PRODUCTOS ---
-elif choice == "Categorías y Productos":
-    st.header("⚙️ Configuración de Base")
-    col1, col2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Unidades en Stock", stock_total)
+        c2.metric("Alertas de Vencimiento", proximos_vencer, delta_color="inverse")
+        c3.metric("Lotes Activos", len(res.data))
+
+        st.write("---")
+        st.subheader("Detalle de Lotes (Prioridad FEFO)")
+        st.dataframe(datos_tabla, use_container_width=True)
+    else:
+        st.info("No hay stock registrado.")
+
+# --- MÓDULO 2: BUSCADOR DE PRODUCTOS ---
+elif choice == "🔍 Buscador de Stock":
+    st.header("Buscador de Productos")
+    busqueda = st.text_input("Escribe el nombre del producto para consultar stock...")
     
-    with col1:
-        st.subheader("Nueva Categoría")
-        nueva_cat = st.text_input("Nombre (ej: Vacunas, Alimento)")
-        if st.button("Guardar Categoría"):
-            if nueva_cat:
-                supabase.table("categorias").insert({"nombre": nueva_cat}).execute()
+    if busqueda:
+        # Buscamos en la tabla productos filtrando por nombre
+        res = supabase.table("inventario_lotes").select("cantidad_actual, fecha_vencimiento, productos!inner(nombre, precio_venta)").ilike("productos.nombre", f"%{busqueda}%").gt("cantidad_actual", 0).execute()
+        
+        if res.data:
+            for r in res.data:
+                with st.expander(f"📦 {r['productos']['nombre']} - Stock: {r['cantidad_actual']}"):
+                    st.write(f"**Precio de Venta:** ${r['productos']['precio_venta']}")
+                    st.write(f"**Vence el:** {r['fecha_vencimiento']}")
+        else:
+            st.warning("No se encontraron productos con ese nombre o no hay stock.")
+
+# --- MÓDULO 3: CATEGORÍAS Y PRODUCTOS ---
+elif choice == "📦 Categorías y Productos":
+    st.header("Configuración de Catálogo")
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.expander("➕ Nueva Categoría"):
+            n_cat = st.text_input("Nombre de Categoría")
+            if st.button("Crear Categoría"):
+                supabase.table("categorias").insert({"nombre": n_cat}).execute()
                 st.success("Categoría creada")
                 st.rerun()
+    with c2:
+        with st.expander("➕ Nuevo Producto"):
+            res_c = supabase.table("categorias").select("*").execute()
+            if res_c.data:
+                cats = {c['nombre']: c['id'] for c in res_c.data}
+                sel_c = st.selectbox("Categoría", list(cats.keys()))
+                n_p = st.text_input("Nombre del Producto")
+                p_v = st.number_input("Precio Venta", min_value=0.0)
+                if st.button("Crear Producto"):
+                    supabase.table("productos").insert({"nombre": n_p, "categoria_id": cats[sel_c], "precio_venta": p_v}).execute()
+                    st.success("Producto creado")
+            else: st.info("Crea una categoría primero")
 
-    with col2:
-        st.subheader("Nuevo Producto")
-        res_cat = supabase.table("categorias").select("*").execute()
-        if res_cat.data:
-            cats = {c['nombre']: c['id'] for c in res_cat.data}
-            cat_sel = st.selectbox("Categoría", list(cats.keys()))
-            nom_prod = st.text_input("Nombre del Producto")
-            prec = st.number_input("Precio de Venta", min_value=0.0)
-            if st.button("Guardar Producto"):
-                supabase.table("productos").insert({"nombre": nom_prod, "categoria_id": cats[cat_sel], "precio_venta": prec}).execute()
-                st.success("Producto creado")
-        else:
-            st.warning("Crea una categoría primero")
-
-# --- MÓDULO 3: ENTRADA DE INVENTARIO (ENTRADAS) ---
-elif choice == "Entrada de Inventario (FEFO)":
-    st.header("📥 Ingreso de Mercancía (Lotes)")
-    
+# --- MÓDULO 4: ENTRADA DE INVENTARIO ---
+elif choice == "📥 Entrada (Lotes/FEFO)":
+    st.header("Registro de Compras / Ingreso de Stock")
     res_p = supabase.table("productos").select("id, nombre").execute()
     if res_p.data:
         prods = {p['nombre']: p['id'] for p in res_p.data}
-        
-        with st.form("form_lotes"):
-            prod_sel = st.selectbox("Seleccionar Producto", list(prods.keys()))
-            c1, c2 = st.columns(2)
-            cant = c1.number_input("Cantidad que ingresa", min_value=1)
-            costo = c2.number_input("Costo Unitario", min_value=0.0)
-            f_venc = st.date_input("Fecha de Vencimiento")
-            
-            if st.form_submit_button("Registrar Entrada"):
-                # Insertar Lote
-                supabase.table("inventario_lotes").insert({
-                    "producto_id": prods[prod_sel],
-                    "cantidad_actual": cant,
-                    "cantidad_inicial": cant,
-                    "costo_unidad": costo,
-                    "fecha_vencimiento": str(f_venc)
-                }).execute()
-                
-                # Registrar Egreso en Caja
-                supabase.table("flujo_caja").insert({
-                    "tipo": "EGRESO",
-                    "monto": cant * costo,
-                    "motivo": f"Compra Stock: {prod_sel}"
-                }).execute()
-                st.success("Entrada y Egreso registrados")
+        with st.form("f_entrada"):
+            p_sel = st.selectbox("Producto", list(prods.keys()))
+            ca, co = st.columns(2)
+            cant = ca.number_input("Cantidad", min_value=1)
+            cost = co.number_input("Costo Unitario", min_value=0.0)
+            venc = st.date_input("Fecha de Vencimiento")
+            if st.form_submit_button("Guardar Entrada"):
+                supabase.table("inventario_lotes").insert({"producto_id": prods[p_sel], "cantidad_actual": cant, "cantidad_inicial": cant, "costo_unidad": cost, "fecha_vencimiento": str(venc)}).execute()
+                supabase.table("flujo_caja").insert({"tipo": "EGRESO", "monto": cant*cost, "motivo": f"Compra: {p_sel}"}).execute()
+                st.success("Entrada registrada correctamente")
                 st.balloons()
-    else:
-        st.error("No hay productos creados.")
 
-# --- MÓDULO 4: VENTAS RÁPIDAS (SALIDAS CON LÓGICA FEFO) ---
-elif choice == "Ventas Rápidas":
-    st.header("🛒 Punto de Venta")
-    
+# --- MÓDULO 5: VENTAS RÁPIDAS ---
+elif choice == "🛒 Ventas Rápidas":
+    st.header("Punto de Venta")
     res_p = supabase.table("productos").select("id, nombre, precio_venta").execute()
-    prods = {p['nombre']: {"id": p['id'], "precio": p['precio_venta']} for p in res_p.data}
-    
-    with st.form("venta_rapida"):
-        prod_venda = st.selectbox("Producto a vender", list(prods.keys()))
-        cant_venda = st.number_input("Cantidad", min_value=1)
-        metodo = st.selectbox("Método de Pago", ["Efectivo", "QR", "Transferencia"])
-        cliente = st.text_input("Cliente (Opcional)")
-        
-        if st.form_submit_button("Finalizar Venta"):
-            id_p = prods[prod_venda]["id"]
-            # BUSCAR LOTES DISPONIBLES ORDENADOS POR VENCIMIENTO (FEFO)
-            lotes = supabase.table("inventario_lotes").select("*").eq("producto_id", id_p).gt("cantidad_actual", 0).order("fecha_vencimiento").execute()
-            
-            if lotes.data:
-                total_disponible = sum(l['cantidad_actual'] for l in lotes.data)
-                if total_disponible >= cant_venda:
-                    # Registrar la Venta Cabecera
-                    venta_total = cant_venda * prods[prod_venda]["precio"]
-                    res_v = supabase.table("ventas").insert({"total": venta_total, "cliente_nombre": cliente, "metodo_pago": metodo}).execute()
-                    id_v = res_v.data[0]['id']
+    if res_p.data:
+        prods = {p['nombre']: {"id": p['id'], "precio": p['precio_venta']} for p in res_p.data}
+        with st.form("f_venta"):
+            p_venda = st.selectbox("Producto", list(prods.keys()))
+            c_venda = st.number_input("Cantidad", min_value=1)
+            met = st.selectbox("Pago", ["Efectivo", "QR", "Tarjeta"])
+            if st.form_submit_button("Vender"):
+                id_p = prods[p_venda]["id"]
+                lotes = supabase.table("inventario_lotes").select("*").eq("producto_id", id_p).gt("cantidad_actual", 0).order("fecha_vencimiento").execute()
+                
+                if lotes.data and sum(l['cantidad_actual'] for l in lotes.data) >= c_venda:
+                    total_v = c_venda * prods[p_venda]["precio"]
+                    # Corregido: Insertamos solo columnas que existen
+                    supabase.table("ventas").insert({"total": total_v, "metodo_pago": met}).execute()
                     
-                    # Descontar de lotes uno por uno (Lógica FEFO)
-                    por_descontar = cant_venda
-                    for lote in lotes.data:
-                        if por_descontar <= 0: break
-                        
-                        can_en_lote = lote['cantidad_actual']
-                        if can_en_lote <= por_descontar:
-                            desc = can_en_lote
-                            por_descontar -= can_en_lote
-                        else:
-                            desc = por_descontar
-                            por_descontar = 0
-                            
-                        # Actualizar Lote
-                        supabase.table("inventario_lotes").update({"cantidad_actual": can_en_lote - desc}).eq("id", lote['id']).execute()
+                    # Lógica FEFO
+                    pendiente = c_venda
+                    for l in lotes.data:
+                        if pendiente <= 0: break
+                        quitar = min(l['cantidad_actual'], pendiente)
+                        supabase.table("inventario_lotes").update({"cantidad_actual": l['cantidad_actual'] - quitar}).eq("id", l['id']).execute()
+                        pendiente -= quitar
                     
-                    # Registrar Ingreso en Caja
-                    supabase.table("flujo_caja").insert({"tipo": "INGRESO", "monto": venta_total, "motivo": f"Venta: {prod_venda}"}).execute()
-                    st.success(f"Venta realizada por ${venta_total}")
-                else:
-                    st.error(f"Stock insuficiente. Solo tienes {total_disponible} unidades.")
-            else:
-                st.error("No hay lotes con stock para este producto.")
+                    supabase.table("flujo_caja").insert({"tipo": "INGRESO", "monto": total_v, "motivo": f"Venta: {p_venda}"}).execute()
+                    st.success(f"Venta OK: ${total_v}")
+                else: st.error("Sin stock suficiente")
 
-# --- MÓDULO 5: FLUJO DE CAJA ---
-elif choice == "Flujo de Caja":
-    st.header("💰 Movimientos de Caja")
-    res_caja = supabase.table("flujo_caja").select("*").order("fecha", desc=True).execute()
-    
-    if res_caja.data:
-        total_ingresos = sum(f['monto'] for f in res_caja.data if f['tipo'] == 'INGRESO')
-        total_egresos = sum(f['monto'] for f in res_caja.data if f['tipo'] == 'EGRESO')
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Ingresos", f"${total_ingresos}")
-        c2.metric("Total Egresos", f"${total_egresos}")
-        c3.metric("Saldo Neto", f"${total_ingresos - total_egresos}")
-        
-        st.dataframe(res_caja.data)
-    else:
-        st.info("Aún no hay movimientos de dinero.")
+# --- MÓDULO 6: FLUJO DE CAJA ---
+elif choice == "💰 Flujo de Caja":
+    st.header("Caja Diaria")
+    res = supabase.table("flujo_caja").select("*").order("fecha", desc=True).execute()
+    if res.data:
+        df = res.data
+        ing = sum(x['monto'] for x in df if x['tipo'] == 'INGRESO')
+        egr = sum(x['monto'] for x in df if x['tipo'] == 'EGRESO')
+        st.metric("Saldo en Caja", f"${ing - egr}", delta=f"Ingresos: ${ing}")
+        st.dataframe(df, use_container_width=True)
