@@ -23,6 +23,7 @@ def check_password():
             and st.session_state.get("password") == st.secrets["LOGIN_PASS"]
         ):
             st.session_state["password_correct"] = True
+            st.session_state["flash_success"] = "Bienvenido"
             del st.session_state["password"]
             del st.session_state["username"]
         else:
@@ -82,18 +83,6 @@ def inject_css():
                 color: #475569;
                 margin-top: 8px;
             }
-            .section-card {
-                background: white;
-                border-radius: 18px;
-                padding: 18px;
-                box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
-                border: 1px solid rgba(226, 232, 240, 0.8);
-                margin-bottom: 14px;
-            }
-            .small-muted {
-                color: #64748b;
-                font-size: 0.9rem;
-            }
             .stMetric {
                 background: white;
                 border: 1px solid rgba(226, 232, 240, 0.8);
@@ -105,6 +94,10 @@ def inject_css():
                 border-radius: 14px;
                 overflow: hidden;
                 border: 1px solid rgba(226, 232, 240, 0.8);
+            }
+            .small-muted {
+                color: #64748b;
+                font-size: 0.92rem;
             }
         </style>
         """,
@@ -191,6 +184,40 @@ def get_timestamp_range(start_date, end_date):
     return start_ts, end_ts
 
 
+def set_flash_success(message):
+    st.session_state["flash_success"] = message
+
+
+def show_flash_success():
+    msg = st.session_state.pop("flash_success", None)
+    if msg:
+        st.success(msg)
+
+
+def render_kpi_card(label, value, delta_text=""):
+    st.markdown(
+        f"""
+        <div class=\"kpi-card\">
+            <div class=\"kpi-label\">{label}</div>
+            <div class=\"kpi-value\">{value}</div>
+            <div class=\"kpi-delta\">{delta_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ==============================
+# QUERIES
+# ==============================
+def fetch_clientes():
+    try:
+        res = supabase.table("clientes").select("id, nombre, telefono, puntos_lealtad").order("nombre").execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
 def fetch_categorias():
     res = supabase.table("categorias").select("id, nombre").order("nombre").execute()
     return res.data or []
@@ -199,7 +226,7 @@ def fetch_categorias():
 def fetch_productos():
     res = (
         supabase.table("productos")
-        .select("id, nombre, precio_venta, unidad_medida, stock_minimo, categoria_id")
+        .select("id, nombre, descripcion, precio_venta, unidad_medida, stock_minimo, categoria_id, categorias(nombre)")
         .order("nombre")
         .execute()
     )
@@ -207,7 +234,7 @@ def fetch_productos():
 
 
 def fetch_ventas(start_date=None, end_date=None):
-    query = supabase.table("ventas").select("*").order("fecha", desc=True)
+    query = supabase.table("ventas").select("id, fecha, metodo_pago, total, observacion, estado, cliente_id, clientes(nombre)").order("fecha", desc=True)
     if start_date and end_date:
         start_ts, end_ts = get_timestamp_range(start_date, end_date)
         query = query.gte("fecha", start_ts).lte("fecha", end_ts)
@@ -236,11 +263,24 @@ def fetch_detalle_ventas_con_producto(start_date=None, end_date=None):
     return query.execute().data or []
 
 
+def fetch_detalles_por_venta(venta_id):
+    try:
+        res = (
+            supabase.table("detalle_ventas")
+            .select("id, venta_id, producto_id, lote_id, cantidad, precio_unitario_aplicado, costo_unitario_lote, productos(nombre, unidad_medida)")
+            .eq("venta_id", venta_id)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
 def fetch_inventario_lotes():
     res = (
         supabase.table("inventario_lotes")
         .select(
-            "id, producto_id, cantidad_actual, cantidad_inicial, costo_unidad, fecha_vencimiento, fecha_ingreso, productos(nombre, unidad_medida, stock_minimo)"
+            "id, producto_id, lote, cantidad_actual, cantidad_inicial, costo_unidad, fecha_vencimiento, fecha_ingreso, productos(nombre, unidad_medida, stock_minimo, precio_venta)"
         )
         .order("fecha_vencimiento")
         .execute()
@@ -262,19 +302,9 @@ def fetch_categorias_caja():
         return []
 
 
-def render_kpi_card(label, value, delta_text=""):
-    st.markdown(
-        f"""
-        <div class=\"kpi-card\">
-            <div class=\"kpi-label\">{label}</div>
-            <div class=\"kpi-value\">{value}</div>
-            <div class=\"kpi-delta\">{delta_text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
+# ==============================
+# NEGOCIO
+# ==============================
 def build_stock_summary(lotes_data):
     rows = []
     grouped = {}
@@ -285,16 +315,19 @@ def build_stock_summary(lotes_data):
         unidad = prod.get("unidad_medida", "Unidad")
         stock_minimo = safe_int(prod.get("stock_minimo", 0))
         cantidad_actual = safe_int(item.get("cantidad_actual", 0))
+        producto_id = item.get("producto_id")
+
         grouped.setdefault(
-            producto,
+            producto_id,
             {
+                "Producto ID": producto_id,
                 "Producto": producto,
                 "Unidad": unidad,
                 "Stock actual": 0,
                 "Stock mínimo": stock_minimo,
             },
         )
-        grouped[producto]["Stock actual"] += cantidad_actual
+        grouped[producto_id]["Stock actual"] += cantidad_actual
 
     for _, row in grouped.items():
         stock_actual = safe_int(row["Stock actual"])
@@ -311,11 +344,78 @@ def build_stock_summary(lotes_data):
     return pd.DataFrame(rows)
 
 
+def compute_product_metrics(producto_id, lotes_data, precio_referencia=None):
+    lotes_prod = [l for l in lotes_data if l.get("producto_id") == producto_id and safe_int(l.get("cantidad_actual")) > 0]
+    stock_total = sum(safe_int(l.get("cantidad_actual")) for l in lotes_prod)
+
+    if stock_total > 0:
+        costo_total = sum(safe_int(l.get("cantidad_actual")) * safe_float(l.get("costo_unidad")) for l in lotes_prod)
+        costo_promedio = costo_total / stock_total
+    else:
+        costo_promedio = 0
+
+    margen_pct_ref = 0
+    precio_ref = safe_float(precio_referencia)
+    if precio_ref > 0:
+        margen_pct_ref = ((precio_ref - costo_promedio) / precio_ref) * 100 if precio_ref else 0
+
+    return {
+        "stock_total": stock_total,
+        "costo_promedio": costo_promedio,
+        "margen_pct_ref": margen_pct_ref,
+    }
+
+
+def anular_venta(venta_id):
+    try:
+        venta_rows = supabase.table("ventas").select("id, total, estado, metodo_pago").eq("id", venta_id).execute().data or []
+        if not venta_rows:
+            return False, "No se encontró la venta."
+
+        venta = venta_rows[0]
+        if venta.get("estado") == "ANULADA":
+            return False, "La venta ya está anulada."
+
+        detalles = fetch_detalles_por_venta(venta_id)
+        if not detalles:
+            return False, "La venta no tiene detalle; no se puede anular de forma segura."
+
+        for det in detalles:
+            lote_id = det.get("lote_id")
+            cantidad = safe_int(det.get("cantidad"))
+            lote_rows = supabase.table("inventario_lotes").select("id, cantidad_actual").eq("id", lote_id).execute().data or []
+            if not lote_rows:
+                return False, f"No se encontró el lote {lote_id} para restaurar stock."
+            lote_actual = lote_rows[0]
+            nuevo_stock = safe_int(lote_actual.get("cantidad_actual")) + cantidad
+            supabase.table("inventario_lotes").update({"cantidad_actual": nuevo_stock}).eq("id", lote_id).execute()
+
+        supabase.table("ventas").update({"estado": "ANULADA"}).eq("id", venta_id).execute()
+
+        supabase.table("flujo_caja").insert(
+            {
+                "tipo": "EGRESO",
+                "monto": safe_float(venta.get("total")),
+                "motivo": f"Anulación de venta {venta_id}",
+                "fecha": datetime.now().isoformat(),
+                "categoria": "ANULACION_VENTA",
+                "metodo_pago": venta.get("metodo_pago", "Efectivo"),
+                "observacion": "Reversión automática por anulación de venta",
+                "venta_id": venta_id,
+            }
+        ).execute()
+
+        return True, "Venta anulada correctamente. El stock fue restaurado y caja ajustada."
+    except Exception as e:
+        return False, f"No se pudo anular la venta: {e}"
+
+
 # ==============================
-# APP PRINCIPAL
+# APP
 # ==============================
 if check_password():
     inject_css()
+    show_flash_success()
 
     st.sidebar.success("Conectado como Administrador")
     if st.sidebar.button("Cerrar Sesión", use_container_width=True):
@@ -331,6 +431,7 @@ if check_password():
         "📊 Dashboard",
         "📦 Catálogo",
         "📥 Entradas",
+        "📦 Stock",
         "🛒 Ventas",
         "💰 Caja",
         "📑 Reportes",
@@ -349,8 +450,8 @@ if check_password():
         ingresos = sum(safe_float(x.get("monto")) for x in flujo if x.get("tipo") == "INGRESO")
         egresos = sum(safe_float(x.get("monto")) for x in flujo if x.get("tipo") == "EGRESO")
         saldo_neto = ingresos - egresos
-        total_ventas = sum(safe_float(v.get("total")) for v in ventas)
-        cantidad_ventas = len(ventas)
+        total_ventas = sum(safe_float(v.get("total")) for v in ventas if v.get("estado") != "ANULADA")
+        cantidad_ventas = len([v for v in ventas if v.get("estado") != "ANULADA"])
         ticket_promedio = total_ventas / cantidad_ventas if cantidad_ventas else 0
 
         stock_df = build_stock_summary(lotes)
@@ -371,7 +472,7 @@ if check_password():
                 por_vencer.append(
                     {
                         "Producto": prod.get("nombre", "Sin nombre"),
-                        "Lote": item.get("id"),
+                        "Lote": item.get("lote") or "-",
                         "Stock": safe_int(item.get("cantidad_actual")),
                         "Vence": venc,
                         "Días": dias,
@@ -383,9 +484,9 @@ if check_password():
         with c1:
             render_kpi_card("Ventas del periodo", format_bs(total_ventas), f"{cantidad_ventas} venta(s)")
         with c2:
-            render_kpi_card("Ingresos", format_bs(ingresos), f"Incluye ventas y otros ingresos")
+            render_kpi_card("Ingresos", format_bs(ingresos), "Incluye ventas y otros ingresos")
         with c3:
-            render_kpi_card("Egresos", format_bs(egresos), f"Compras y gastos operativos")
+            render_kpi_card("Egresos", format_bs(egresos), "Compras y gastos operativos")
         with c4:
             render_kpi_card("Saldo neto", format_bs(saldo_neto), f"Ticket promedio: {format_bs(ticket_promedio)}")
 
@@ -398,11 +499,11 @@ if check_password():
             st.metric("Lotes por vencer (30 días)", len(por_vencer))
 
         left, right = st.columns((1.4, 1))
-
         with left:
             st.markdown("### Evolución de ventas")
-            if ventas:
-                ventas_df = pd.DataFrame(ventas)
+            ventas_validas = [v for v in ventas if v.get("estado") != "ANULADA"]
+            if ventas_validas:
+                ventas_df = pd.DataFrame(ventas_validas)
                 ventas_df["fecha"] = pd.to_datetime(ventas_df["fecha"])
                 ventas_por_dia = ventas_df.groupby(ventas_df["fecha"].dt.date)["total"].sum().reset_index()
                 ventas_por_dia.columns = ["Fecha", "Ventas"]
@@ -412,8 +513,9 @@ if check_password():
 
         with right:
             st.markdown("### Ventas por método de pago")
-            if ventas:
-                ventas_metodo_df = pd.DataFrame(ventas)
+            ventas_validas = [v for v in ventas if v.get("estado") != "ANULADA"]
+            if ventas_validas:
+                ventas_metodo_df = pd.DataFrame(ventas_validas)
                 ventas_metodo = ventas_metodo_df.groupby("metodo_pago")["total"].sum().reset_index()
                 ventas_metodo.columns = ["Método de pago", "Ventas"]
                 st.bar_chart(ventas_metodo.set_index("Método de pago"))
@@ -453,7 +555,7 @@ if check_password():
                 if alertas_df.empty:
                     st.success("No hay alertas de stock en este momento.")
                 else:
-                    st.dataframe(alertas_df, use_container_width=True, hide_index=True)
+                    st.dataframe(alertas_df[["Producto", "Unidad", "Stock actual", "Stock mínimo", "Estado"]], use_container_width=True, hide_index=True)
             else:
                 st.info("No hay datos de inventario.")
 
@@ -467,11 +569,12 @@ if check_password():
     # CATALOGO
     # ==============================
     elif choice == "📦 Catálogo":
-        st.header("Gestión de productos")
-        col1, col2 = st.columns(2)
+        st.header("Gestión de categorías y productos")
+        tab1, tab2, tab3, tab4 = st.tabs(["Crear categoría", "Editar categoría", "Crear producto", "Editar producto"])
 
-        with col1:
-            st.subheader("Nueva categoría")
+        categorias = fetch_categorias()
+
+        with tab1:
             with st.form("form_categoria", clear_on_submit=True):
                 n_cat = st.text_input("Nombre de la categoría")
                 submit_cat = st.form_submit_button("Crear categoría", use_container_width=True)
@@ -481,16 +584,33 @@ if check_password():
                     else:
                         try:
                             supabase.table("categorias").insert({"nombre": n_cat.strip()}).execute()
-                            st.success("Categoría creada correctamente.")
+                            set_flash_success("✅ Categoría creada correctamente")
                             st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo crear la categoría: {e}")
 
-        with col2:
-            st.subheader("Nuevo producto")
-            categorias = fetch_categorias()
+        with tab2:
             if not categorias:
-                st.info("Primero crea al menos una categoría.")
+                st.info("No hay categorías para editar.")
+            else:
+                cat_map = {c["nombre"]: c for c in categorias}
+                cat_name = st.selectbox("Categoría a editar", list(cat_map.keys()))
+                cat_item = cat_map[cat_name]
+                nuevo_nombre = st.text_input("Nuevo nombre", value=cat_item["nombre"], key="edit_cat_name")
+                if st.button("Guardar cambios categoría", use_container_width=True):
+                    if not nuevo_nombre.strip():
+                        st.warning("El nombre no puede estar vacío.")
+                    else:
+                        try:
+                            supabase.table("categorias").update({"nombre": nuevo_nombre.strip()}).eq("id", cat_item["id"]).execute()
+                            set_flash_success("✅ Categoría actualizada")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo editar la categoría: {e}")
+
+        with tab3:
+            if not categorias:
+                st.info("Primero crea una categoría.")
             else:
                 cats = {c["nombre"]: c["id"] for c in categorias}
                 with st.form("form_producto", clear_on_submit=True):
@@ -498,7 +618,7 @@ if check_password():
                     n_p = st.text_input("Nombre del producto")
                     desc_p = st.text_area("Descripción")
                     u_m = st.selectbox("Unidad de medida", ["Unidad", "Kg", "Gr", "Ml", "Lt", "Tabletas", "Caja", "Frasco"])
-                    p_v = st.number_input("Precio de venta", min_value=0.0, step=0.5)
+                    p_v = st.number_input("Precio de venta referencial", min_value=0.0, step=0.5)
                     s_min = st.number_input("Stock mínimo", min_value=0, value=5, step=1)
                     submit_prod = st.form_submit_button("Crear producto", use_container_width=True)
                     if submit_prod:
@@ -516,25 +636,72 @@ if check_password():
                                         "stock_minimo": s_min,
                                     }
                                 ).execute()
-                                st.success("Producto creado con éxito.")
+                                set_flash_success("✅ Producto creado correctamente")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"No se pudo crear el producto: {e}")
 
+        with tab4:
+            productos = fetch_productos()
+            if not productos:
+                st.info("No hay productos para editar.")
+            else:
+                prod_map = {p["nombre"]: p for p in productos}
+                prod_name = st.selectbox("Producto a editar", list(prod_map.keys()))
+                prod_item = prod_map[prod_name]
+                categorias = fetch_categorias()
+                cats = {c["nombre"]: c["id"] for c in categorias}
+                categoria_actual = None
+                for nombre_cat, id_cat in cats.items():
+                    if id_cat == prod_item.get("categoria_id"):
+                        categoria_actual = nombre_cat
+                        break
+                idx_cat = list(cats.keys()).index(categoria_actual) if categoria_actual in cats else 0
+
+                with st.form("form_edit_producto"):
+                    new_cat = st.selectbox("Categoría", list(cats.keys()), index=idx_cat)
+                    new_nombre = st.text_input("Nombre", value=prod_item.get("nombre", ""))
+                    new_desc = st.text_area("Descripción", value=prod_item.get("descripcion", ""))
+                    unidades = ["Unidad", "Kg", "Gr", "Ml", "Lt", "Tabletas", "Caja", "Frasco"]
+                    unidad_actual = prod_item.get("unidad_medida", "Unidad")
+                    idx_unidad = unidades.index(unidad_actual) if unidad_actual in unidades else 0
+                    new_unidad = st.selectbox("Unidad de medida", unidades, index=idx_unidad)
+                    new_precio = st.number_input("Precio de venta referencial", min_value=0.0, value=safe_float(prod_item.get("precio_venta")), step=0.5)
+                    new_stock_min = st.number_input("Stock mínimo", min_value=0, value=safe_int(prod_item.get("stock_minimo")), step=1)
+                    submit_edit = st.form_submit_button("Guardar cambios producto", use_container_width=True)
+                    if submit_edit:
+                        try:
+                            supabase.table("productos").update(
+                                {
+                                    "categoria_id": cats[new_cat],
+                                    "nombre": new_nombre.strip(),
+                                    "descripcion": new_desc.strip(),
+                                    "unidad_medida": new_unidad,
+                                    "precio_venta": new_precio,
+                                    "stock_minimo": new_stock_min,
+                                }
+                            ).eq("id", prod_item["id"]).execute()
+                            set_flash_success("✅ Producto actualizado")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo editar el producto: {e}")
+
         st.markdown("### Catálogo actual")
         productos = fetch_productos()
         if productos:
-            df_prod = pd.DataFrame(productos)
-            df_prod["precio_venta"] = df_prod["precio_venta"].apply(format_bs)
-            df_prod = df_prod.rename(
-                columns={
-                    "nombre": "Producto",
-                    "precio_venta": "Precio venta",
-                    "unidad_medida": "Unidad",
-                    "stock_minimo": "Stock mínimo",
-                }
-            )
-            st.dataframe(df_prod[["Producto", "Precio venta", "Unidad", "Stock mínimo"]], use_container_width=True, hide_index=True)
+            rows = []
+            for p in productos:
+                categoria = (p.get("categorias") or {}).get("nombre", "-")
+                rows.append(
+                    {
+                        "Producto": p.get("nombre"),
+                        "Categoría": categoria,
+                        "Precio venta": format_bs(p.get("precio_venta")),
+                        "Unidad": p.get("unidad_medida"),
+                        "Stock mínimo": safe_int(p.get("stock_minimo")),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
             st.info("Todavía no hay productos registrados.")
 
@@ -550,6 +717,7 @@ if check_password():
             prods = {f"{p['nombre']} ({p.get('unidad_medida', 'Unidad')})": p for p in productos}
             with st.form("f_ent", clear_on_submit=True):
                 p_sel = st.selectbox("Producto", list(prods.keys()))
+                lote_txt = st.text_input("Lote")
                 ca = st.number_input("Cantidad", min_value=1, step=1)
                 co = st.number_input("Costo unitario", min_value=0.0, step=0.5)
                 ve = st.date_input("Fecha de vencimiento")
@@ -563,6 +731,7 @@ if check_password():
                         supabase.table("inventario_lotes").insert(
                             {
                                 "producto_id": prod["id"],
+                                "lote": lote_txt.strip() or None,
                                 "cantidad_actual": ca,
                                 "cantidad_inicial": ca,
                                 "costo_unidad": co,
@@ -582,7 +751,8 @@ if check_password():
                             }
                         ).execute()
 
-                        st.success("Entrada registrada correctamente.")
+                        set_flash_success("✅ Entrada registrada correctamente")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo registrar la entrada: {e}")
 
@@ -595,6 +765,7 @@ if check_password():
                 rows.append(
                     {
                         "Producto": prod.get("nombre", "Sin nombre"),
+                        "Lote": item.get("lote") or "-",
                         "Cantidad actual": safe_int(item.get("cantidad_actual")),
                         "Cantidad inicial": safe_int(item.get("cantidad_inicial")),
                         "Costo unitario": format_bs(item.get("costo_unidad")),
@@ -607,45 +778,138 @@ if check_password():
             st.info("No hay lotes registrados.")
 
     # ==============================
+    # STOCK
+    # ==============================
+    elif choice == "📦 Stock":
+        st.header("Consulta de stock")
+        lotes = fetch_inventario_lotes()
+        stock_df = build_stock_summary(lotes)
+
+        if stock_df.empty:
+            st.info("No hay stock registrado.")
+        else:
+            buscador = st.text_input("Buscar producto")
+            view_df = stock_df.copy()
+            if buscador.strip():
+                mask = view_df["Producto"].str.contains(buscador.strip(), case=False, na=False)
+                view_df = view_df[mask]
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Productos con stock", len(view_df))
+            with c2:
+                st.metric("Stock bajo", int((view_df["Estado"] == "Bajo").sum()))
+            with c3:
+                st.metric("Agotados", int((view_df["Estado"] == "Agotado").sum()))
+
+            st.dataframe(view_df[["Producto", "Unidad", "Stock actual", "Stock mínimo", "Estado"]], use_container_width=True, hide_index=True)
+
+            producto_options = view_df["Producto"].tolist()
+            if producto_options:
+                producto_sel = st.selectbox("Ver detalle de producto", producto_options)
+                producto_row = view_df[view_df["Producto"] == producto_sel].iloc[0]
+                producto_id = producto_row["Producto ID"]
+                lotes_prod = [l for l in lotes if l.get("producto_id") == producto_id]
+                ref_precio = 0
+                for l in lotes_prod:
+                    prod = l.get("productos") or {}
+                    ref_precio = safe_float(prod.get("precio_venta"))
+                    if ref_precio > 0:
+                        break
+                metrics = compute_product_metrics(producto_id, lotes, ref_precio)
+                st.markdown("### Detalle del producto")
+                d1, d2, d3, d4 = st.columns(4)
+                with d1:
+                    st.metric("Stock disponible", f"{metrics['stock_total']} {producto_row['Unidad']}")
+                with d2:
+                    st.metric("Costo promedio ponderado", format_bs(metrics["costo_promedio"]))
+                with d3:
+                    st.metric("Precio venta referencial", format_bs(ref_precio))
+                with d4:
+                    st.metric("Margen referencial", f"{metrics['margen_pct_ref']:.2f}%")
+
+                detalle_lotes = []
+                for item in lotes_prod:
+                    detalle_lotes.append(
+                        {
+                            "Lote": item.get("lote") or "-",
+                            "Cantidad actual": safe_int(item.get("cantidad_actual")),
+                            "Costo unitario": format_bs(item.get("costo_unidad")),
+                            "Vencimiento": item.get("fecha_vencimiento"),
+                        }
+                    )
+                if detalle_lotes:
+                    st.dataframe(pd.DataFrame(detalle_lotes), use_container_width=True, hide_index=True)
+
+    # ==============================
     # VENTAS
     # ==============================
     elif choice == "🛒 Ventas":
         st.header("Punto de venta")
         productos = fetch_productos()
+        clientes = fetch_clientes()
+        lotes = fetch_inventario_lotes()
 
         if not productos:
             st.info("Primero registra productos en el catálogo.")
         else:
             prods = {f"{p['nombre']} ({p.get('unidad_medida', 'Unidad')})": p for p in productos}
+            client_map = {c['nombre']: c['id'] for c in clientes} if clientes else {}
+            client_names = ["Venta rápida / Sin cliente"] + list(client_map.keys())
+
+            p_sel_name = st.selectbox("Producto", list(prods.keys()))
+            p_data = prods[p_sel_name]
+            metrics = compute_product_metrics(p_data["id"], lotes, p_data.get("precio_venta"))
+            unidad = p_data.get("unidad_medida", "Unidad")
+            precio_ref = safe_float(p_data.get("precio_venta"))
+
+            cinfo1, cinfo2, cinfo3, cinfo4 = st.columns(4)
+            with cinfo1:
+                st.metric("Stock disponible", f"{metrics['stock_total']} {unidad}")
+            with cinfo2:
+                st.metric("Unidad", unidad)
+            with cinfo3:
+                st.metric("Costo promedio", format_bs(metrics["costo_promedio"]))
+            with cinfo4:
+                st.metric("Precio referencial", format_bs(precio_ref))
 
             with st.form("f_venta"):
-                p_sel_name = st.selectbox("Producto", list(prods.keys()))
-                c_venda = st.number_input("Cantidad", min_value=1, step=1)
+                cliente_sel = st.selectbox("Cliente", client_names)
+                c_venda = st.number_input(f"Cantidad ({unidad})", min_value=1, step=1)
+                precio_final = st.number_input("Precio unitario final", min_value=0.0, value=precio_ref, step=0.5)
                 met = st.selectbox("Método de pago", ["Efectivo", "QR", "Tarjeta", "Transferencia"])
                 observacion = st.text_input("Observación")
+
+                total_estimado = c_venda * precio_final
+                margen_pct_final = ((precio_final - metrics["costo_promedio"]) / precio_final) * 100 if precio_final > 0 else 0
+                utilidad_estimada = (precio_final - metrics["costo_promedio"]) * c_venda
+
+                st.markdown(f"**Total estimado:** {format_bs(total_estimado)}")
+                st.markdown(f"**Margen estimado:** {margen_pct_final:.2f}%")
+                st.markdown(f"**Utilidad estimada:** {format_bs(utilidad_estimada)}")
+
                 submit_venta = st.form_submit_button("Finalizar venta", use_container_width=True)
 
             if submit_venta:
-                p_data = prods[p_sel_name]
                 try:
-                    lotes = (
-                        supabase.table("inventario_lotes")
-                        .select("id, cantidad_actual, costo_unidad, fecha_vencimiento")
-                        .eq("producto_id", p_data["id"])
-                        .gt("cantidad_actual", 0)
-                        .order("fecha_vencimiento")
-                        .execute()
-                    )
-                    lotes_data = lotes.data or []
+                    lotes_data = [
+                        l for l in lotes
+                        if l.get("producto_id") == p_data["id"] and safe_int(l.get("cantidad_actual")) > 0
+                    ]
+                    lotes_data = sorted(lotes_data, key=lambda x: (str(x.get("fecha_vencimiento") or "9999-12-31"), str(x.get("fecha_ingreso") or "")))
                     stock_total = sum(safe_int(l["cantidad_actual"]) for l in lotes_data)
 
-                    if not lotes_data or stock_total < c_venda:
-                        st.error("Stock insuficiente para completar la venta.")
+                    if stock_total < c_venda:
+                        st.error(f"Stock insuficiente. Solo hay {stock_total} {unidad} disponibles.")
+                    elif precio_final <= 0:
+                        st.error("El precio final debe ser mayor a cero.")
                     else:
-                        total_v = c_venda * safe_float(p_data["precio_venta"])
+                        cliente_id = None if cliente_sel == "Venta rápida / Sin cliente" else client_map.get(cliente_sel)
+                        total_v = c_venda * safe_float(precio_final)
 
                         venta_insert = supabase.table("ventas").insert(
                             {
+                                "cliente_id": cliente_id,
                                 "total": total_v,
                                 "metodo_pago": met,
                                 "fecha": datetime.now().isoformat(),
@@ -679,15 +943,12 @@ if check_password():
                                         "producto_id": p_data["id"],
                                         "lote_id": lote["id"],
                                         "cantidad": quitar,
-                                        "precio_unitario_aplicado": safe_float(p_data["precio_venta"]),
+                                        "precio_unitario_aplicado": safe_float(precio_final),
                                         "costo_unitario_lote": safe_float(lote.get("costo_unidad")),
                                     }
                                 ).execute()
 
-                                supabase.table("inventario_lotes").update(
-                                    {"cantidad_actual": nuevo_stock}
-                                ).eq("id", lote["id"]).execute()
-
+                                supabase.table("inventario_lotes").update({"cantidad_actual": nuevo_stock}).eq("id", lote["id"]).execute()
                                 detalles_insertados += 1
                                 pendiente -= quitar
 
@@ -704,29 +965,52 @@ if check_password():
                                 }
                             ).execute()
 
-                            st.success(
-                                f"Venta registrada correctamente. Total: {format_bs(total_v)} | Detalles generados: {detalles_insertados}"
+                            set_flash_success(
+                                f"✅ Venta registrada. Total: {format_bs(total_v)} | Cliente: {cliente_sel} | Detalles: {detalles_insertados}"
                             )
+                            st.rerun()
 
                 except Exception as e:
                     st.error(f"No se pudo completar la venta: {e}")
 
-        st.markdown("### Últimas ventas")
+        st.markdown("### Historial de ventas")
         ventas = fetch_ventas(start_date, end_date)
         if ventas:
-            ventas_df = pd.DataFrame(ventas)
-            ventas_df["total"] = ventas_df["total"].apply(format_bs)
-            ventas_df = ventas_df.rename(
-                columns={
-                    "fecha": "Fecha",
-                    "metodo_pago": "Método de pago",
-                    "total": "Total",
-                    "estado": "Estado",
-                    "observacion": "Observación",
-                }
-            )
-            cols = [c for c in ["Fecha", "Método de pago", "Total", "Estado", "Observación"] if c in ventas_df.columns]
-            st.dataframe(ventas_df[cols], use_container_width=True, hide_index=True)
+            rows = []
+            for v in ventas:
+                cliente = (v.get("clientes") or {}).get("nombre", "Venta rápida")
+                rows.append(
+                    {
+                        "ID": v.get("id"),
+                        "Fecha": v.get("fecha"),
+                        "Cliente": cliente,
+                        "Método de pago": v.get("metodo_pago"),
+                        "Total": format_bs(v.get("total")),
+                        "Estado": v.get("estado"),
+                        "Observación": v.get("observacion") or "",
+                    }
+                )
+            ventas_df = pd.DataFrame(rows)
+            st.dataframe(ventas_df, use_container_width=True, hide_index=True)
+
+            st.markdown("### Anular venta")
+            ventas_activas = [v for v in ventas if v.get("estado") != "ANULADA"]
+            if ventas_activas:
+                venta_opts = {}
+                for v in ventas_activas:
+                    cliente = (v.get("clientes") or {}).get("nombre", "Venta rápida")
+                    etiqueta = f"{str(v.get('fecha'))[:19]} | {cliente} | {format_bs(v.get('total'))}"
+                    venta_opts[etiqueta] = v["id"]
+                venta_sel = st.selectbox("Selecciona la venta a anular", list(venta_opts.keys()))
+                if st.button("Anular venta seleccionada", type="secondary", use_container_width=True):
+                    ok, msg = anular_venta(venta_opts[venta_sel])
+                    if ok:
+                        set_flash_success(f"✅ {msg}")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            else:
+                st.info("No hay ventas activas para anular en el rango seleccionado.")
         else:
             st.info("No hay ventas en el rango seleccionado.")
 
@@ -748,10 +1032,10 @@ if check_password():
             "RETIRO",
             "AJUSTE",
             "OTROS",
+            "ANULACION_VENTA",
         ]
 
         c1, c2 = st.columns((1, 1.4))
-
         with c1:
             st.subheader("Registrar movimiento")
             with st.form("form_caja", clear_on_submit=True):
@@ -784,7 +1068,7 @@ if check_password():
                                     "referencia": referencia.strip(),
                                 }
                             ).execute()
-                            st.success("Movimiento registrado correctamente.")
+                            set_flash_success("✅ Movimiento registrado correctamente")
                             st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo registrar el movimiento: {e}")
@@ -819,19 +1103,19 @@ if check_password():
         flujo = fetch_flujo_caja(start_date, end_date)
         if flujo:
             flujo_df = pd.DataFrame(flujo)
-            if "monto" in flujo_df.columns:
-                flujo_df["monto"] = flujo_df["monto"].apply(format_bs)
-            rename_map = {
-                "fecha": "Fecha",
-                "tipo": "Tipo",
-                "categoria": "Categoría",
-                "motivo": "Motivo",
-                "monto": "Monto",
-                "metodo_pago": "Método de pago",
-                "observacion": "Observación",
-                "referencia": "Referencia",
-            }
-            flujo_df = flujo_df.rename(columns=rename_map)
+            flujo_df["monto"] = flujo_df["monto"].apply(format_bs)
+            flujo_df = flujo_df.rename(
+                columns={
+                    "fecha": "Fecha",
+                    "tipo": "Tipo",
+                    "categoria": "Categoría",
+                    "motivo": "Motivo",
+                    "monto": "Monto",
+                    "metodo_pago": "Método de pago",
+                    "observacion": "Observación",
+                    "referencia": "Referencia",
+                }
+            )
             cols = [c for c in ["Fecha", "Tipo", "Categoría", "Motivo", "Monto", "Método de pago", "Observación", "Referencia"] if c in flujo_df.columns]
             st.dataframe(flujo_df[cols], use_container_width=True, hide_index=True)
         else:
@@ -846,6 +1130,7 @@ if check_password():
 
         with tab1:
             ventas = fetch_ventas(start_date, end_date)
+            ventas = [v for v in ventas if v.get("estado") != "ANULADA"]
             detalles = fetch_detalle_ventas_con_producto(start_date, end_date)
 
             total_ventas = sum(safe_float(v.get("total")) for v in ventas)
@@ -863,8 +1148,10 @@ if check_password():
             if detalles:
                 rows = []
                 for d in detalles:
-                    prod = d.get("productos") or {}
                     venta = d.get("ventas") or {}
+                    if venta and venta.get("total") is None:
+                        continue
+                    prod = d.get("productos") or {}
                     cantidad = safe_int(d.get("cantidad"))
                     precio = safe_float(d.get("precio_unitario_aplicado"))
                     costo = safe_float(d.get("costo_unitario_lote"))
@@ -872,6 +1159,7 @@ if check_password():
                         {
                             "Fecha": venta.get("fecha"),
                             "Producto": prod.get("nombre", "Sin nombre"),
+                            "Unidad": prod.get("unidad_medida", "Unidad"),
                             "Cantidad": cantidad,
                             "Precio unitario": precio,
                             "Ingreso": cantidad * precio,
@@ -881,31 +1169,33 @@ if check_password():
                         }
                     )
                 det_df = pd.DataFrame(rows)
+                if not det_df.empty:
+                    st.markdown("#### Resumen por producto")
+                    resumen_prod = (
+                        det_df.groupby(["Producto", "Unidad"], as_index=False)
+                        .agg({"Cantidad": "sum", "Ingreso": "sum", "Costo": "sum", "Utilidad bruta": "sum"})
+                        .sort_values(by="Ingreso", ascending=False)
+                    )
+                    resumen_prod["Ingreso"] = resumen_prod["Ingreso"].apply(format_bs)
+                    resumen_prod["Costo"] = resumen_prod["Costo"].apply(format_bs)
+                    resumen_prod["Utilidad bruta"] = resumen_prod["Utilidad bruta"].apply(format_bs)
+                    st.dataframe(resumen_prod, use_container_width=True, hide_index=True)
 
-                st.markdown("#### Resumen por producto")
-                resumen_prod = (
-                    det_df.groupby("Producto", as_index=False)
-                    .agg({"Cantidad": "sum", "Ingreso": "sum", "Costo": "sum", "Utilidad bruta": "sum"})
-                    .sort_values(by="Ingreso", ascending=False)
-                )
-                resumen_prod["Ingreso"] = resumen_prod["Ingreso"].apply(format_bs)
-                resumen_prod["Costo"] = resumen_prod["Costo"].apply(format_bs)
-                resumen_prod["Utilidad bruta"] = resumen_prod["Utilidad bruta"].apply(format_bs)
-                st.dataframe(resumen_prod, use_container_width=True, hide_index=True)
+                    st.markdown("#### Detalle de ventas")
+                    view_df = det_df.copy()
+                    for col in ["Precio unitario", "Ingreso", "Costo", "Utilidad bruta"]:
+                        view_df[col] = view_df[col].apply(format_bs)
+                    st.dataframe(view_df, use_container_width=True, hide_index=True)
 
-                st.markdown("#### Detalle de ventas")
-                view_df = det_df.copy()
-                for col in ["Precio unitario", "Ingreso", "Costo", "Utilidad bruta"]:
-                    view_df[col] = view_df[col].apply(format_bs)
-                st.dataframe(view_df, use_container_width=True, hide_index=True)
-
-                csv = view_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Descargar reporte de ventas (CSV)",
-                    data=csv,
-                    file_name=f"reporte_ventas_{start_date}_{end_date}.csv",
-                    mime="text/csv",
-                )
+                    csv = view_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Descargar reporte de ventas (CSV)",
+                        data=csv,
+                        file_name=f"reporte_ventas_{start_date}_{end_date}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("No hay detalle de ventas para este periodo.")
             else:
                 st.info("No hay datos de ventas para este periodo.")
 
@@ -953,7 +1243,7 @@ if check_password():
                 stock_df = build_stock_summary(lotes)
                 if not stock_df.empty:
                     st.markdown("#### Stock consolidado")
-                    st.dataframe(stock_df, use_container_width=True, hide_index=True)
+                    st.dataframe(stock_df[["Producto", "Unidad", "Stock actual", "Stock mínimo", "Estado"]], use_container_width=True, hide_index=True)
 
                 rows = []
                 for item in lotes:
@@ -963,6 +1253,7 @@ if check_password():
                     rows.append(
                         {
                             "Producto": prod.get("nombre", "Sin nombre"),
+                            "Lote": item.get("lote") or "-",
                             "Cantidad actual": cantidad,
                             "Costo unitario": format_bs(costo),
                             "Valor stock": format_bs(cantidad * costo),
